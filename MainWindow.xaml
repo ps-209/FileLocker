@@ -1,0 +1,39 @@
+﻿<hc:Window  xmlns:hc="https://handyorg.github.io/handycontrol" x:Class="FileLocker.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+        xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+        xmlns:local="clr-namespace:FileLocker" Background="{DynamicResource RegionBrush}" Foreground="{DynamicResource PrimaryTextBrush}"
+        mc:Ignorable="d"
+        Title="FileLocker v1.0.0" ResizeMode="CanMinimize" WindowStartupLocation="CenterScreen" Height="360" Width="600">
+    <Grid>
+        <hc:Divider Content="File" Margin="20,10,20,0" Grid.ColumnSpan="2" Height="20" VerticalAlignment="Top"/>
+
+        <Grid Height="30" Width="560" HorizontalAlignment="Left" VerticalAlignment="Top" Margin="20,40,0,20">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="Auto"/>
+            </Grid.ColumnDefinitions>
+            <hc:TextBox x:Name="dir_box" Text="" hc:InfoElement.Placeholder="C:\example\files\a.txt" AllowDrop="True" PreviewDragOver="dir_box_PreviewDragOver" Drop="dir_box_Drop" hc:InfoElement.ShowClearButton="True" FontFamily="Consolas" BorderThickness="1" hc:BorderElement.CornerRadius="4,0,0,4"/>
+            <Button Grid.Column="1" x:Name="open_button" Content="Open" Click="OpenButton_Click" Height="30" Width="78" Margin="0,0,0,0" hc:BorderElement.CornerRadius="0,4,4,0"/>
+        </Grid>
+
+        <hc:Divider Content="Mode Select" Margin="20,80,20,0" Grid.ColumnSpan="2" Height="20" VerticalAlignment="Top"/>
+
+        <hc:ButtonGroup x:Name ="mode_group" Margin="20,110,20,0" VerticalAlignment="Top">
+            <RadioButton x:Name="lockButton" Content="Lock" IsChecked="True" Margin="0,0,0,0"/>
+            <RadioButton x:Name="unlockButton" Content="Unlock" Margin="0,0,0,0"/>
+        </hc:ButtonGroup>
+
+        <Button Content="Start" x:Name="start_button" Click="StartButton_Click" FontSize="15" Margin="0,160,0,0" VerticalAlignment="Top" Height="60" Width="200"/>
+
+        <hc:StepBar x:Name="LockStepBar" StepIndex="0" VerticalAlignment="Top" Margin="0,240,0,0" HorizontalAlignment="Center" Width="600">
+            <hc:StepBarItem Content="ReadFile"/>
+            <hc:StepBarItem Content="Lock/Unlock"/>
+            <hc:StepBarItem Content="Error Correction"/>
+            <hc:StepBarItem Content="File Compile"/>
+            <hc:StepBarItem Content="Complete"/>
+        </hc:StepBar>
+        <TextBlock x:Name="speed_text" Text="0 MB / 0 MB" HorizontalAlignment="Center" Margin="0,300,0,0" TextWrapping="Wrap"  VerticalAlignment="Top"/>
+    </Grid>
+</hc:Window>
