@@ -31,8 +31,10 @@ const NONCE_LEN: usize = 12;
 // 5: 파일 쓰기, 생성 또는 삭제 실패
 // 6: 멀티스레드/병렬 처리 환경 오류
 
+type ProgressCallback = extern "C" fn(f32);
+
 #[unsafe(no_mangle)]
-pub extern "C" fn dll_locking(src_path_ptr: *const u16, password_ptr: *const c_char) -> u8 {
+pub extern "C" fn dll_locking(src_path_ptr: *const u16, password_ptr: *const c_char, total_size: u64, progress_callback: ProgressCallback) -> u8 {
     let src_path = unsafe {
         if src_path_ptr.is_null() { return 1; }
         let mut len = 0; while *src_path_ptr.offset(len) != 0 { len += 1; }
@@ -42,11 +44,11 @@ pub extern "C" fn dll_locking(src_path_ptr: *const u16, password_ptr: *const c_c
         if password_ptr.is_null() { return 3; }
         CStr::from_ptr(password_ptr).to_str().unwrap_or("")
     };
-    match locking_internal(&src_path, password) { Ok(_) => 0, Err(e) => e }
+    match locking_internal(&src_path, password, total_size, progress_callback) { Ok(_) => 0, Err(e) => e }
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn dll_unlocking(lock_file_path_ptr: *const u16, password_ptr: *const c_char) -> u8 {
+pub extern "C" fn dll_unlocking(lock_file_path_ptr: *const u16, password_ptr: *const c_char, total_lock_size: u64, progress_callback: ProgressCallback) -> u8 {
     let lock_file_path = unsafe {
         if lock_file_path_ptr.is_null() { return 1; }
         let mut len = 0; while *lock_file_path_ptr.offset(len) != 0 { len += 1; }
@@ -56,7 +58,7 @@ pub extern "C" fn dll_unlocking(lock_file_path_ptr: *const u16, password_ptr: *c
         if password_ptr.is_null() { return 3; }
         CStr::from_ptr(password_ptr).to_str().unwrap_or("")
     };
-    match unlocking_internal(&lock_file_path, password) { Ok(_) => 0, Err(e) => e }
+    match unlocking_internal(&lock_file_path, password, total_lock_size, progress_callback) { Ok(_) => 0, Err(e) => e }
 }
 
 struct StreamingWriter {
@@ -227,10 +229,14 @@ fn decode_rs_mt(payload: Vec<u8>, pool: &rayon::ThreadPool) -> Result<Vec<u8>, B
 
 // --- [핵심 로직: Locking] ---
 
-pub fn locking_internal(src_path: &str, password: &str) -> Result<(), u8> {
+pub fn locking_internal(src_path: &str, password: &str, total_size: u64, progress_callback: ProgressCallback) -> Result<(), u8> {
     let pool = rayon::ThreadPoolBuilder::new().num_threads(num_cpus::get().saturating_sub(2).max(1)).build().map_err(|_| 6u8)?;
     let path = Path::new(src_path);
     if !path.exists() { return Err(1); }
+    
+    let mut processed_size: u64 = 0;
+
+
     let is_dir = path.is_dir();
     let file_name = path.file_name().ok_or(1u8)?.to_str().ok_or(1u8)?.as_bytes();
 
@@ -292,6 +298,8 @@ pub fn locking_internal(src_path: &str, password: &str) -> Result<(), u8> {
     // locking_internal 함수 내부 메인 루프
     while let Ok(chunk) = rx.recv() {
         if chunk.is_empty() { continue; } // 빈 데이터 스킵
+
+        let chunk_len = chunk.len() as u64;
         
         let enc = encryptor.encrypt(&nonce, chunk.clone()).map_err(|_| 3u8)?;
         // RS 인코딩 호출 (여기서 4번 에러 발생 지점)
@@ -302,11 +310,19 @@ pub fn locking_internal(src_path: &str, password: &str) -> Result<(), u8> {
     
         writer.write_all(&(payload.len() as u64).to_le_bytes()).map_err(|_| 5u8)?;
         writer.write_all(&payload).map_err(|_| 5u8)?;
+
+        //진행률 계산 및 콜백 호출
+        processed_size += chunk_len;
+        if total_size > 0 {
+            let progress = (processed_size as f32 / total_size as f32).min(1.0);
+            progress_callback(progress); // C#으로 현재 진행률(0.0~1.0) 전송
+        }
         
         let mut old = chunk;
         old.clear();
         let _ = pool_tx.try_send(old);
     }
+    progress_callback(1.0);
     writer.flush().map_err(|_| 5u8)?;
     if is_dir { fs::remove_dir_all(src_path).ok(); } else { fs::remove_file(src_path).ok(); }
     Ok(())
@@ -314,53 +330,79 @@ pub fn locking_internal(src_path: &str, password: &str) -> Result<(), u8> {
 
 // --- [핵심 로직: Unlocking] ---
 
-pub fn unlocking_internal(lock_file_path: &str, password: &str) -> Result<(), u8> {
+pub fn unlocking_internal(lock_file_path: &str, password: &str, total_lock_size: u64,progress_callback: ProgressCallback) -> Result<(), u8> {
     let pool = rayon::ThreadPoolBuilder::new().num_threads(num_cpus::get().saturating_sub(2).max(1)).build().map_err(|_| 6u8)?;
-    let mut reader = BufReader::with_capacity(1024 * 1024, File::open(lock_file_path).map_err(|_| 2u8)?);
+    let lock_file = File::open(lock_file_path).map_err(|_| 2u8)?;
     
+    // 진행률 계산을 위한 전체 파일 크기 확인
+    let mut reader = BufReader::with_capacity(1024 * 1024, lock_file);
+    let mut processed_size: u64 = 0;
+
+    // --- [헤더 읽기 로직] ---
     let mut magic = [0u8; 4]; reader.read_exact(&mut magic).map_err(|_| 2u8)?;
     if &magic != b"LSTR" { return Err(2); }
+    processed_size += 4;
 
     let mut t_buf = [0u8; 1]; reader.read_exact(&mut t_buf).map_err(|_| 2u8)?;
     let mut nl_buf = [0u8; 4]; reader.read_exact(&mut nl_buf).map_err(|_| 2u8)?;
-    let mut name_buf = vec![0u8; u32::from_le_bytes(nl_buf) as usize];
+    let name_len = u32::from_le_bytes(nl_buf) as usize;
+    let mut name_buf = vec![0u8; name_len];
     reader.read_exact(&mut name_buf).map_err(|_| 2u8)?;
     let mut salt = [0u8; 16]; reader.read_exact(&mut salt).map_err(|_| 2u8)?;
     let mut nonce = [0u8; NONCE_LEN]; reader.read_exact(&mut nonce).map_err(|_| 2u8)?;
+    
+    // 헤더만큼 처리량 증가
+    processed_size += 1 + 4 + name_len as u64 + 16 + NONCE_LEN as u64;
 
     let encryptor = Encryptor::new(KeyManager::from_existing(salt).derive_key(password));
     let mut out_path = PathBuf::from(lock_file_path);
     out_path.set_file_name(String::from_utf8(name_buf).map_err(|_| 2u8)?);
 
     let (tx, rx) = sync_channel::<Vec<u8>>(3);
-    if t_buf[0] == 0 {
+
+    if t_buf[0] == 0 { // 폴더 모드
         let out_p = out_path.clone();
         let handle = thread::spawn(move || {
             let mut arch = Archive::new(ChannelReader { rx, current_chunk: None });
             arch.unpack(out_p)
         });
+
         loop {
             let mut l_buf = [0u8; 8];
             if reader.read_exact(&mut l_buf).is_err() { break; }
-            let mut b_data = vec![0u8; u64::from_le_bytes(l_buf) as usize];
+            let chunk_payload_len = u64::from_le_bytes(l_buf);
+            let mut b_data = vec![0u8; chunk_payload_len as usize];
             reader.read_exact(&mut b_data).map_err(|_| 2u8)?;
+
             let dec = encryptor.decrypt(&nonce, decode_rs_mt(b_data, &pool).map_err(|_| 4u8)?).map_err(|_| 3u8)?;
             if tx.send(dec).is_err() { break; }
+
+            // 진행률 업데이트
+            processed_size += 8 + chunk_payload_len;
+            progress_callback((processed_size as f32 / total_lock_size as f32).min(1.0));
         }
-        drop(tx); handle.join().map_err(|_| 6u8)?.map_err(|_| 5u8)?;
-    } else {
+        drop(tx);
+        handle.join().map_err(|_| 6u8)?.map_err(|_| 5u8)?;
+    } else { // 단일 파일 모드
         let mut out_f = BufWriter::with_capacity(1024 * 1024, File::create(&out_path).map_err(|_| 5u8)?);
         loop {
             let mut l_buf = [0u8; 8];
             if reader.read_exact(&mut l_buf).is_err() { break; }
-            let mut b_data = vec![0u8; u64::from_le_bytes(l_buf) as usize];
+            let chunk_payload_len = u64::from_le_bytes(l_buf);
+            let mut b_data = vec![0u8; chunk_payload_len as usize];
             reader.read_exact(&mut b_data).map_err(|_| 2u8)?;
+
             let dec = encryptor.decrypt(&nonce, decode_rs_mt(b_data, &pool).map_err(|_| 4u8)?).map_err(|_| 3u8)?;
             out_f.write_all(&dec).map_err(|_| 5u8)?;
+
+            processed_size += 8 + chunk_payload_len;
+            progress_callback((processed_size as f32 / total_lock_size as f32).min(1.0));
         }
         out_f.flush().map_err(|_| 5u8)?;
     }
-    fs::remove_file(lock_file_path).ok();
+
+    progress_callback(1.0);
+    fs::remove_file(lock_file_path).ok(); // 원본 .lock 파일 삭제
     Ok(())
 }
 
