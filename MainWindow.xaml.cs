@@ -28,6 +28,8 @@ namespace FileLocker
     [SupportedOSPlatform("windows7.0")]
     public partial class MainWindow : Window
     {
+        private bool _isProcessing = false;
+        private bool _isClosingPending = false;
         public MainWindow()
         {
             InitializeComponent();
@@ -67,6 +69,16 @@ namespace FileLocker
         }
         private async void StartButton_Click(object sender, RoutedEventArgs e)
         {
+            if (_isProcessing)
+            {
+                Locker.LockerEngine.dll_cancel_operation();
+                start_button.Content = "Stopping...";
+                start_button.IsEnabled = false;
+                speed_text.Text = "0 MB / 0 MB";
+                LockStepBar.StepIndex = 0;
+                return;
+            }
+
             //파일 검증
             string file_path = dir_box.Text;
             string mode = this.lockButton.IsChecked == true ? "Lock" : "Unlock";
@@ -101,6 +113,10 @@ namespace FileLocker
 
             //작업
             long totalSize = 0;
+            LockStepBar.StepIndex = 1;
+            _isProcessing = true;
+            start_button.Content = "Stop";
+            start_button.IsEnabled = true;
 
             DateTime startTime = DateTime.Now;
 
@@ -124,11 +140,10 @@ namespace FileLocker
                     speed_text.Text = $"{currentMB:F1} MB / {totalMB:F1} MB ({speed:F1} MB/s)";
                 });
             };
+
             try
             {
                 byte result;
-                LockStepBar.StepIndex = 1;
-                start_button.IsEnabled = false;
                 if (isLockMode)
                 {
                     totalSize = Directory.Exists(file_path) ? GetDirectorySize(file_path) : new FileInfo(file_path).Length;
@@ -139,10 +154,19 @@ namespace FileLocker
                     totalSize = new FileInfo(file_path).Length;
                     result = await Task.Run(() => Locker.LockerEngine.dll_unlocking(file_path, password, totalSize ,progressAction));
                 }
+
                 password = string.Empty;
-                LockStepBar.StepIndex = 5;
-                double totalMB = totalSize / 1024.0 / 1024.0;
-                speed_text.Text = $"{totalMB:F1} MB / {totalMB:F1} MB (완료)";
+                if (result == 0) // 성공 시에만 완료 상태 표시
+                {
+                    LockStepBar.StepIndex = 5;
+                    double totalMB = totalSize / 1024.0 / 1024.0;
+                    speed_text.Text = $"{totalMB:F1} MB / {totalMB:F1} MB (완료)";
+                }
+                else if (result == 100) // 취소 시
+                {
+                    LockStepBar.StepIndex = 0;
+                    speed_text.Text = "작업이 취소되었습니다.";
+                }
                 ProcessComplete(result);
             }
             catch (DllNotFoundException)
@@ -151,7 +175,14 @@ namespace FileLocker
             }
             finally
             {
+                await Task.Delay(2000);
+                _isProcessing = false;
+                start_button.Content = "Start";
                 start_button.IsEnabled = true;
+                if (_isClosingPending)
+                {
+                    this.Close();
+                }
             }
         }
         private void ModeAutoSelect() //파일이면서 .lock으로 끝나는 파일일시
@@ -180,12 +211,16 @@ namespace FileLocker
                 4 => "오류 복구 인코딩/디코딩에 실패했습니다.",
                 5 => "파일 쓰기/삭제에 실패했습니다.",
                 6 => "멀티스레드 처리에 오류가 발생했습니다.",
+                100 => "진행중인 작업을 취소했습니다.",
                 _ => "알 수 없는 오류가 발생했습니다."
             };
             if (code == 0)
             {
                 Growl.Success(new GrowlInfo { Message = msi, ShowDateTime = false });
-
+            }
+            else if (code == 100)
+            {
+                Growl.Info(new GrowlInfo { Message = msi, ShowDateTime = false });
             }
             else
             {
@@ -195,6 +230,22 @@ namespace FileLocker
         private long GetDirectorySize(string path)
         {
             return Directory.GetFiles(path, "*", SearchOption.AllDirectories).Sum(f => new FileInfo(f).Length);
+        }
+        private void Window_Closing(object sender, System.ComponentModel.CancelEventArgs e)
+        {
+            if (_isProcessing)
+            {
+                e.Cancel = true;
+                _isClosingPending = true;
+
+                Locker.LockerEngine.dll_cancel_operation();
+
+                start_button.Content = "Closing...";
+                start_button.IsEnabled = false;
+
+                string msi = "중단하고 종료합니다.";
+                Growl.Info(new GrowlInfo { Message = msi, ShowDateTime = false });
+            }
         }
     }
 }

@@ -1,4 +1,6 @@
-﻿using System;
+﻿using HandyControl.Tools;
+using HandyControl.Data;
+using System;
 using System.Collections.Generic;
 using System.Configuration;
 using System.Data;

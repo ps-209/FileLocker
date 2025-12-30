@@ -8,6 +8,8 @@
             <ResourceDictionary.MergedDictionaries>
                 <hc:ThemeResources/>
                 <hc:Theme/>
+
+                <hc:ThemeResources UsingSystemTheme="true"/>
             </ResourceDictionary.MergedDictionaries>
             <Style TargetType="Button" BasedOn="{StaticResource ButtonDefault}">
                 <Style.Triggers>

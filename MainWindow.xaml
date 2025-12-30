@@ -4,8 +4,8 @@
         xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
         xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
         xmlns:local="clr-namespace:FileLocker" Background="{DynamicResource RegionBrush}" Foreground="{DynamicResource PrimaryTextBrush}"
-        mc:Ignorable="d"
-        Title="FileLocker v1.0.0" ResizeMode="CanMinimize" WindowStartupLocation="CenterScreen" Height="360" Width="600">
+        mc:Ignorable="d" Closing="Window_Closing"
+        Title="FileLocker v1.0.1" ResizeMode="CanMinimize" WindowStartupLocation="CenterScreen" Height="360" Width="600">
     <Grid>
         <hc:Divider Content="File" Margin="20,10,20,0" Grid.ColumnSpan="2" Height="20" VerticalAlignment="Top"/>
 

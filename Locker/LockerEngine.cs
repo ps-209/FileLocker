@@ -15,5 +15,8 @@ namespace FileLocker.Locker
 
         [DllImport(DllPath, CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Unicode)]
         public static extern byte dll_unlocking([MarshalAs(UnmanagedType.LPWStr)] string lockFilePath,[MarshalAs(UnmanagedType.LPStr)] string password, long totalSize, ProgressCallback callback);
+
+        [DllImport(DllPath, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void dll_cancel_operation();
     }
 }
