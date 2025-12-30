@@ -8,6 +8,7 @@ use std::os::raw::c_char;
 use std::os::windows::ffi::OsStringExt;
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::thread;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tar::{Builder, Archive};
 use walkdir::WalkDir;
@@ -21,6 +22,8 @@ const CHUNK_SIZE: usize = 100 * 1024 * 1024;
 const DATA_SHARDS: usize = 10;
 const PARITY_SHARDS: usize = 2;
 const NONCE_LEN: usize = 12;
+
+static CANCEL_FLAG: AtomicBool = AtomicBool::new(false);
 
 // 에러 코드 정의
 // 0: 성공
@@ -59,6 +62,11 @@ pub extern "C" fn dll_unlocking(lock_file_path_ptr: *const u16, password_ptr: *c
         CStr::from_ptr(password_ptr).to_str().unwrap_or("")
     };
     match unlocking_internal(&lock_file_path, password, total_lock_size, progress_callback) { Ok(_) => 0, Err(e) => e }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn dll_cancel_operation() {
+    CANCEL_FLAG.store(true, Ordering::SeqCst);
 }
 
 struct StreamingWriter {
@@ -234,7 +242,9 @@ pub fn locking_internal(src_path: &str, password: &str, total_size: u64, progres
     let path = Path::new(src_path);
     if !path.exists() { return Err(1); }
     
-    let mut processed_size: u64 = 0;
+    let mut processed_size: u64 = 0; //진행도
+    CANCEL_FLAG.store(false, Ordering::SeqCst); //작업 중단 변수 초기화
+    let mut run_result: Result<(), u8> = Ok(());
 
 
     let is_dir = path.is_dir();
@@ -264,6 +274,9 @@ pub fn locking_internal(src_path: &str, password: &str, total_size: u64, progres
         if is_dir {
             let mut arch = Builder::new(StreamingWriter { tx, pool_rx });
             for entry in WalkDir::new(&src_p).into_iter().filter_map(|e| e.ok()) {
+                if CANCEL_FLAG.load(Ordering::SeqCst) {
+                    return; // 스레드 즉시 종료
+                }
                 let p = entry.path();
                 let name = p.strip_prefix(Path::new(&src_p)).unwrap();
                 if p.is_file() {
@@ -287,6 +300,9 @@ pub fn locking_internal(src_path: &str, password: &str, total_size: u64, progres
             if let Ok(f) = File::open(&src_p) {
                 let mut r = BufReader::with_capacity(1024*1024, f);
                 loop {
+                    if CANCEL_FLAG.load(Ordering::SeqCst) {
+                        return; // 스레드 즉시 종료
+                    }
                     let mut v = pool_rx.try_recv().unwrap_or_else(|_| vec![0u8; CHUNK_SIZE]);
                     v.resize(CHUNK_SIZE, 0);
                     match r.read(&mut v) { Ok(0) | Err(_) => break, Ok(n) => { v.truncate(n); if tx.send(v).is_err() { break; } } }
@@ -297,6 +313,11 @@ pub fn locking_internal(src_path: &str, password: &str, total_size: u64, progres
 
     // locking_internal 함수 내부 메인 루프
     while let Ok(chunk) = rx.recv() {
+        if CANCEL_FLAG.load(Ordering::SeqCst) {
+            run_result = Err(100);
+            break;
+        }
+
         if chunk.is_empty() { continue; } // 빈 데이터 스킵
 
         let chunk_len = chunk.len() as u64;
@@ -322,8 +343,15 @@ pub fn locking_internal(src_path: &str, password: &str, total_size: u64, progres
         old.clear();
         let _ = pool_tx.try_send(old);
     }
+    writer.flush().ok();
+    drop(writer);
+
+    if let Err(e) = run_result {
+        fs::remove_file(&out_path).ok();
+        return Err(e);
+    }
+
     progress_callback(1.0);
-    writer.flush().map_err(|_| 5u8)?;
     if is_dir { fs::remove_dir_all(src_path).ok(); } else { fs::remove_file(src_path).ok(); }
     Ok(())
 }
@@ -337,6 +365,10 @@ pub fn unlocking_internal(lock_file_path: &str, password: &str, total_lock_size:
     // 진행률 계산을 위한 전체 파일 크기 확인
     let mut reader = BufReader::with_capacity(1024 * 1024, lock_file);
     let mut processed_size: u64 = 0;
+
+    //작업 중단
+    CANCEL_FLAG.store(false, Ordering::SeqCst);
+    let mut run_result: Result<(), u8> = Ok(());
 
     // --- [헤더 읽기 로직] ---
     let mut magic = [0u8; 4]; reader.read_exact(&mut magic).map_err(|_| 2u8)?;
@@ -368,6 +400,10 @@ pub fn unlocking_internal(lock_file_path: &str, password: &str, total_lock_size:
         });
 
         loop {
+            if CANCEL_FLAG.load(Ordering::SeqCst) {
+                run_result = Err(100);
+                break;
+            }
             let mut l_buf = [0u8; 8];
             if reader.read_exact(&mut l_buf).is_err() { break; }
             let chunk_payload_len = u64::from_le_bytes(l_buf);
@@ -382,10 +418,14 @@ pub fn unlocking_internal(lock_file_path: &str, password: &str, total_lock_size:
             progress_callback((processed_size as f32 / total_lock_size as f32).min(1.0));
         }
         drop(tx);
-        handle.join().map_err(|_| 6u8)?.map_err(|_| 5u8)?;
+        handle.join().ok();
     } else { // 단일 파일 모드
         let mut out_f = BufWriter::with_capacity(1024 * 1024, File::create(&out_path).map_err(|_| 5u8)?);
         loop {
+            if CANCEL_FLAG.load(Ordering::SeqCst) {
+                run_result = Err(100);
+                break;
+            }
             let mut l_buf = [0u8; 8];
             if reader.read_exact(&mut l_buf).is_err() { break; }
             let chunk_payload_len = u64::from_le_bytes(l_buf);
@@ -398,7 +438,18 @@ pub fn unlocking_internal(lock_file_path: &str, password: &str, total_lock_size:
             processed_size += 8 + chunk_payload_len;
             progress_callback((processed_size as f32 / total_lock_size as f32).min(1.0));
         }
-        out_f.flush().map_err(|_| 5u8)?;
+        out_f.flush().ok();
+        drop(out_f);
+    }
+    
+    if let Err(e) = run_result {
+        // 복호화 중단 시: 풀다 만 파일이나 폴더 삭제
+        if out_path.is_dir() {
+            fs::remove_dir_all(&out_path).ok();
+        } else {
+            fs::remove_file(&out_path).ok();
+        }
+        return Err(e);
     }
 
     progress_callback(1.0);
