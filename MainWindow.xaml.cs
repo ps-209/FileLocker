@@ -19,6 +19,7 @@ using System.Windows.Navigation;
 using System.Windows.Shapes;
 using File = System.IO.File;
 using Window = HandyControl.Controls.Window;
+using FileLocker.Locker;
 
 namespace FileLocker
 {
@@ -71,89 +72,83 @@ namespace FileLocker
         {
             if (_isProcessing)
             {
-                Locker.LockerEngine.dll_cancel_operation();
-                start_button.Content = "Stopping...";
+                LockerEngine.dll_cancel_operation();
                 start_button.IsEnabled = false;
-                speed_text.Text = "0 MB / 0 MB";
-                LockStepBar.StepIndex = 0;
+                start_button.Content = "Stopping...";
+                speed_text.Text = "정리 및 취소 중...";
                 return;
             }
 
-            //파일 검증
+            //실행중 아닐시 초기 설정
             string file_path = dir_box.Text;
-            string mode = this.lockButton.IsChecked == true ? "Lock" : "Unlock";
             bool isLockMode = this.lockButton.IsChecked == true;
 
-            LockStepBar.StepIndex = 0;
-            speed_text.Text = "0 MB / 0 MB";
+            _isProcessing = true;
+            start_button.IsEnabled = false;
+            dir_box.IsEnabled = false;   // 작업 중 경로 변경 방지
+            mode_group.IsEnabled = false;
 
             if (string.IsNullOrWhiteSpace(file_path) || (!File.Exists(file_path) && !Directory.Exists(file_path)))
             {
                 string msi = "유효한 파일이나 폴더를 선택해 주세요.";
                 Growl.Warning(new GrowlInfo { Message = msi, ShowDateTime = false });
+                ResetToStart();
                 return;
             }
-            if(!isLockMode && !file_path.EndsWith(".lock", StringComparison.OrdinalIgnoreCase))
+            if (!isLockMode && !file_path.EndsWith(".lock", StringComparison.OrdinalIgnoreCase))
             {
                 string msi = "일반 파일을 언락할 수 없습니다.";
                 Growl.Warning(new GrowlInfo { Message = msi, ShowDateTime = false });
+                ResetToStart();
                 return;
             }
 
-            //비번 입력
             PasswordWindow pwWin = new PasswordWindow();
             pwWin.Owner = this;
             if (pwWin.ShowDialog() == false)
             {
                 string msi = "작업이 취소되었습니다.";
                 Growl.Info(new GrowlInfo { Message = msi, ShowDateTime = false });
+                ResetToStart();
+                ModeAutoSelect();
                 return;
             }
             string password = pwWin.Password;
 
-            //작업
-            long totalSize = 0;
-            LockStepBar.StepIndex = 1;
-            _isProcessing = true;
-            start_button.Content = "Stop";
-            start_button.IsEnabled = true;
-
-            DateTime startTime = DateTime.Now;
-
-            Locker.ProgressCallback progressAction = (progress) =>
-            {
-                Dispatcher.Invoke(() =>
-                {
-                    // [UI - StepBar] 1.0이 들어와도 최대 4단계까지만 표시 (전체 5단계 중)
-                    int currentStep = (int)(progress * 3) + 1; // 0.0~1.0 -> 1~4단계 매핑
-                    LockStepBar.StepIndex = Math.Min(currentStep, 4);
-
-                    // [Data - MB/s] 실제 처리 용량 계산
-                    double currentMB = (totalSize * progress) / 1024.0 / 1024.0;
-                    double totalMB = totalSize / 1024.0 / 1024.0;
-
-                    // 속도 계산
-                    double elapsed = (DateTime.Now - startTime).TotalSeconds;
-                    double speed = elapsed > 0 ? currentMB / elapsed : 0;
-
-                    // 텍스트 업데이트 (예: 120.5 MB / 500.0 MB (24.1 MB/s))
-                    speed_text.Text = $"{currentMB:F1} MB / {totalMB:F1} MB ({speed:F1} MB/s)";
-                });
-            };
-
             try
             {
-                byte result;
-                if (isLockMode)
+                start_button.Content = "Wait...";
+
+                long totalSize = await Task.Run(() => Directory.Exists(file_path) ? GetDirectorySize(file_path) : new FileInfo(file_path).Length);
+
+                //프로세스 단계
+                DateTime startTime = DateTime.Now;
+
+                Locker.ProgressCallback progressAction = (progress) =>
                 {
-                    totalSize = Directory.Exists(file_path) ? GetDirectorySize(file_path) : new FileInfo(file_path).Length;
-                    result = await Task.Run(() => Locker.LockerEngine.dll_locking(file_path, password, totalSize, progressAction));
-                }
-                else
-                {
-                    totalSize = new FileInfo(file_path).Length;
-                    result = await Task.Run(() => Locker.LockerEngine.dll_unlocking(file_path, password, totalSize ,progressAction));
-                }
+                    Dispatcher.Invoke(() =>
+                    {
+                        // [UI - StepBar] 1.0이 들어와도 최대 4단계까지만 표시 (전체 5단계 중)
+                        int currentStep = (int)(progress * 3) + 1; // 0.0~1.0 -> 1~4단계 매핑
+                        LockStepBar.StepIndex = Math.Min(currentStep, 4);
+
+                        // [Data - MB/s] 실제 처리 용량 계산
+                        double currentMB = (totalSize * progress) / 1024.0 / 1024.0;
+                        double totalMB = totalSize / 1024.0 / 1024.0;
+
+                        // 속도 계산
+                        double elapsed = (DateTime.Now - startTime).TotalSeconds;
+                        double speed = elapsed > 0 ? currentMB / elapsed : 0;
+
+                        // 텍스트 업데이트 (예: 120.5 MB / 500.0 MB (24.1 MB/s))
+                        speed_text.Text = $"{currentMB:F1} MB / {totalMB:F1} MB ({speed:F1} MB/s)";
+                    });
+                };
+
+                start_button.Content = "Stop";
+                start_button.IsEnabled = true;
+
+                byte result = await Task.Run(() => isLockMode ? LockerEngine.dll_locking(file_path, password, totalSize, progressAction) : LockerEngine.dll_unlocking(file_path, password, totalSize, progressAction));
 
                 password = string.Empty;
                 if (result == 0) // 성공 시에만 완료 상태 표시
@@ -166,6 +161,7 @@ namespace FileLocker
                 {
                     LockStepBar.StepIndex = 0;
                     speed_text.Text = "작업이 취소되었습니다.";
+                    ModeAutoSelect();
                 }
                 ProcessComplete(result);
             }
@@ -173,16 +169,22 @@ namespace FileLocker
             {
                 Growl.Error(new GrowlInfo { Message = "암호화 엔진 DLL을 찾을 수 없습니다", ShowDateTime = false });
             }
+            catch (Exception ex)
+            {
+                Growl.Error(new GrowlInfo { Message = $"오류 : {ex}", ShowDateTime = false });
+            }
             finally
             {
-                await Task.Delay(2000);
-                _isProcessing = false;
                 start_button.Content = "Start";
-                start_button.IsEnabled = true;
-                if (_isClosingPending)
-                {
-                    this.Close();
-                }
+                start_button.IsEnabled = false; // ★ 2초간 조작 불능 상태 유지
+
+                await Task.Delay(2000); // UI는 Start로 보이지만 클릭은 안 되는 쿨다운 시간
+
+                _isProcessing = false;
+                start_button.IsEnabled = true; // 이제서야 다시 시작 가능
+                dir_box.IsEnabled = true;
+
+                if (_isClosingPending) this.Close();
             }
         }
         private void ModeAutoSelect() //파일이면서 .lock으로 끝나는 파일일시
@@ -230,6 +232,15 @@ namespace FileLocker
         private long GetDirectorySize(string path)
         {
             return Directory.GetFiles(path, "*", SearchOption.AllDirectories).Sum(f => new FileInfo(f).Length);
+        }
+        private void ResetToStart()
+        {
+            _isProcessing = false;
+            start_button.IsEnabled = true;
+            dir_box.IsEnabled = true;
+            start_button.Content = "Start";
+            LockStepBar.StepIndex = 0;
+            speed_text.Text = "0 MB / 0 MB";
         }
         private void Window_Closing(object sender, System.ComponentModel.CancelEventArgs e)
         {

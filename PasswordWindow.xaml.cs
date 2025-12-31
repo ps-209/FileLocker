@@ -1,6 +1,9 @@
-﻿using System;
+﻿using HandyControl.Controls;
+using HandyControl.Data;
+using System;
 using System.Collections.Generic;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Data;
@@ -9,7 +12,6 @@ using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using System.Windows.Shapes;
-using HandyControl.Controls;
 using Window = System.Windows.Window;
 //using Window = HandyControl.Controls.Window;
 namespace FileLocker
@@ -29,12 +31,19 @@ namespace FileLocker
         }
         private void OkButton_Click(object sender, RoutedEventArgs e)
         {
-            this.DialogResult = true; // 창을 닫으며 true 반환
+            this.DialogResult = true;
         }
 
         private void CancelButton_Click(object sender, RoutedEventArgs e)
         {
             this.DialogResult = false; // 창을 닫으며 false 반환
+        }
+        private void PasswordInput_PreviewKeyDown(object sender, System.Windows.Input.KeyEventArgs e)
+        {
+            if (e.Key == System.Windows.Input.Key.Space)
+            {
+                e.Handled = true; // 이벤트 무효화
+            }
         }
     }
 }
