@@ -1,5 +1,6 @@
 # FileLocker
-<img width="900" height="540" alt="image" src="https://github.com/user-attachments/assets/eebd4b98-f221-4719-9b51-7b87149eae04" />
+
+<img width="900" height="540" alt="1 0 2" src="https://github.com/user-attachments/assets/5f39f66c-886d-48d3-9322-e53281c518a4" />
 
 
 
