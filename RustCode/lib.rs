@@ -17,24 +17,17 @@ use reed_solomon_simd::{ReedSolomonDecoder, ReedSolomonEncoder};
 use crc32fast::Hasher;
 use rayon::prelude::*;
 
-// --- [상수 및 에러 코드] ---
-const CHUNK_SIZE: usize = 100 * 1024 * 1024; 
+// --- [상수 설정] ---
+const CHUNK_SIZE: usize = 100 * 1024 * 1024; // 100MB
 const DATA_SHARDS: usize = 10;
 const PARITY_SHARDS: usize = 2;
 const NONCE_LEN: usize = 12;
 
 static CANCEL_FLAG: AtomicBool = AtomicBool::new(false);
 
-// 에러 코드 정의
-// 0: 성공
-// 1: 대상 경로(파일/폴더) 찾을 수 없음
-// 2: 데이터 읽기 실패 (파일 오픈, 헤더 인식 등)
-// 3: 암호화/복호화 실패 (키 유도, 태그 불일치 등)
-// 4: 리드 솔로몬/CRC 오류
-// 5: 파일 쓰기, 생성 또는 삭제 실패
-// 6: 멀티스레드/병렬 처리 환경 오류
-
 type ProgressCallback = extern "C" fn(f32);
+
+// --- [DLL 인터페이스] ---
 
 #[unsafe(no_mangle)]
 pub extern "C" fn dll_locking(src_path_ptr: *const u16, password_ptr: *const c_char, total_size: u64, progress_callback: ProgressCallback) -> u8 {
@@ -69,20 +62,39 @@ pub extern "C" fn dll_cancel_operation() {
     CANCEL_FLAG.store(true, Ordering::SeqCst);
 }
 
+// --- [스트리밍 최적화 라이터] ---
+
 struct StreamingWriter {
     tx: SyncSender<Vec<u8>>,
     pool_rx: Receiver<Vec<u8>>,
+    internal_buffer: Vec<u8>, // 속도 최적화를 위한 버퍼링
 }
 
 impl Write for StreamingWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let mut vec = self.pool_rx.try_recv().unwrap_or_else(|_| Vec::with_capacity(CHUNK_SIZE));
-        vec.clear();
-        vec.extend_from_slice(buf);
-        self.tx.send(vec).map_err(|e| std::io::Error::new(std::io::ErrorKind::BrokenPipe, e))?;
+        self.internal_buffer.extend_from_slice(buf);
+
+        // 버퍼가 100MB를 넘을 때만 암호화 엔진으로 전송
+        while self.internal_buffer.len() >= CHUNK_SIZE {
+            let mut chunk = self.pool_rx.try_recv().unwrap_or_else(|_| Vec::with_capacity(CHUNK_SIZE));
+            chunk.clear();
+            chunk.extend_from_slice(&self.internal_buffer[..CHUNK_SIZE]);
+            
+            self.tx.send(chunk).map_err(|e| std::io::Error::new(std::io::ErrorKind::BrokenPipe, e))?;
+            self.internal_buffer.drain(..CHUNK_SIZE);
+        }
         Ok(buf.len())
     }
-    fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    
+    fn flush(&mut self) -> std::io::Result<()> {
+        // 루프 종료 후 남은 찌꺼기 데이터 전송
+        if !self.internal_buffer.is_empty() {
+            let chunk = self.internal_buffer.clone();
+            let _ = self.tx.send(chunk);
+            self.internal_buffer.clear();
+        }
+        Ok(())
+    }
 }
 
 struct ChannelReader { rx: Receiver<Vec<u8>>, current_chunk: Option<Cursor<Vec<u8>>> }
@@ -101,7 +113,7 @@ impl Read for ChannelReader {
     }
 }
 
-// --- [암호화 및 RS 로직 생략되지 않은 핵심 함수] ---
+// --- [보안 및 RS 모듈] ---
 
 pub struct KeyManager { pub salt: [u8; 16], pub iterations: NonZeroU32 }
 impl KeyManager {
@@ -132,33 +144,24 @@ impl Encryptor {
     pub fn new(key: [u8; 32]) -> Self { Self { key_bytes: key } }
     pub fn encrypt(&self, nonce_bytes: &[u8], mut data: Vec<u8>) -> Result<Vec<u8>, ring::error::Unspecified> {
         let unbound_key = UnboundKey::new(&aead::AES_256_GCM, &self.key_bytes)?;
-        let nonce = aead::Nonce::try_assume_unique_for_key(nonce_bytes)?;
-        let mut sealing_key = SealingKey::new(unbound_key, OneNonceSequence(nonce));
+        let mut sealing_key = SealingKey::new(unbound_key, OneNonceSequence(aead::Nonce::try_assume_unique_for_key(nonce_bytes)?));
         sealing_key.seal_in_place_append_tag(aead::Aad::empty(), &mut data)?;
         Ok(data)
     }
     pub fn decrypt(&self, nonce_bytes: &[u8], mut data: Vec<u8>) -> Result<Vec<u8>, ring::error::Unspecified> {
         let unbound_key = UnboundKey::new(&aead::AES_256_GCM, &self.key_bytes)?;
-        let nonce = aead::Nonce::try_assume_unique_for_key(nonce_bytes)?;
-        let mut opening_key = aead::OpeningKey::new(unbound_key, OneNonceSequence(nonce));
-        let decrypted_data = opening_key.open_in_place(aead::Aad::empty(), &mut data)?;
-        Ok(decrypted_data.to_vec())
+        let mut opening_key = aead::OpeningKey::new(unbound_key, OneNonceSequence(aead::Nonce::try_assume_unique_for_key(nonce_bytes)?));
+        let dec = opening_key.open_in_place(aead::Aad::empty(), &mut data)?;
+        Ok(dec.to_vec())
     }
 }
 
 fn encode_rs_mt(data: Vec<u8>, pool: &rayon::ThreadPool) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let actual_len = data.len();
-    if actual_len == 0 { return Err("Empty data".into()); }
-
-    // 1. 샤드 크기 결정 (최소 1바이트 보장 및 짝수 정렬)
     let mut shard_size = (actual_len + DATA_SHARDS - 1) / DATA_SHARDS;
     if shard_size == 0 { shard_size = 1; }
     if shard_size % 2 != 0 { shard_size += 1; }
 
-    // 2. 전체 필요 데이터 크기 (DATA_SHARDS * shard_size) 사용 안함
-    let _total_data_size = DATA_SHARDS * shard_size;
-
-    // 3. 데이터를 샤드 크기에 맞게 패딩 및 분할
     let all_shards: Vec<Vec<u8>> = pool.install(|| {
         (0..DATA_SHARDS).into_par_iter().map(|i| {
             let start = i * shard_size;
@@ -171,18 +174,12 @@ fn encode_rs_mt(data: Vec<u8>, pool: &rayon::ThreadPool) -> Result<Vec<u8>, Box<
         }).collect()
     });
 
-    // 4. RS 인코딩
     let mut encoder = ReedSolomonEncoder::new(DATA_SHARDS, PARITY_SHARDS, shard_size)?;
-    for s in &all_shards {
-        encoder.add_original_shard(s)?;
-    }
+    for s in &all_shards { encoder.add_original_shard(s)?; }
     let result = encoder.encode()?;
     
-    // 5. 결과 패키징 (병렬 CRC 계산)
     let final_payload = pool.install(|| {
-        let recovery_shards: Vec<Vec<u8>> = result.recovery_iter().map(|s| s.to_vec()).collect();
-        let combined: Vec<Vec<u8>> = all_shards.into_iter().chain(recovery_shards).collect();
-
+        let combined: Vec<Vec<u8>> = all_shards.into_iter().chain(result.recovery_iter().map(|s| s.to_vec())).collect();
         let processed: Vec<Vec<u8>> = combined.into_par_iter().map(|mut shard| {
             let mut hasher = Hasher::new();
             hasher.update(&shard);
@@ -192,11 +189,9 @@ fn encode_rs_mt(data: Vec<u8>, pool: &rayon::ThreadPool) -> Result<Vec<u8>, Box<
 
         let mut buffer = Vec::new();
         for s in processed { buffer.extend_from_slice(&s); }
-        // 복구를 위해 실제 데이터 길이를 저장
         buffer.extend_from_slice(&(actual_len as u64).to_le_bytes());
         buffer
     });
-
     Ok(final_payload)
 }
 
@@ -205,31 +200,32 @@ fn decode_rs_mt(payload: Vec<u8>, pool: &rayon::ThreadPool) -> Result<Vec<u8>, B
     let actual_len = u64::from_le_bytes(payload[data_len_pos..].try_into()?) as usize;
     let shard_full_len = data_len_pos / (DATA_SHARDS + PARITY_SHARDS);
     let shard_size = shard_full_len - 4;
-    let shard_chunks: Vec<&[u8]> = payload[..data_len_pos].chunks(shard_full_len).collect();
+    
     let verified: Vec<(usize, bool, &[u8])> = pool.install(|| {
-        shard_chunks.into_par_iter().enumerate().map(|(idx, full)| {
-            let (content, crc_bytes) = full.split_at(shard_size);
-            let mut hasher = Hasher::new(); hasher.update(content);
-            (idx, hasher.finalize().to_le_bytes() == crc_bytes, content)
+        payload[..data_len_pos].chunks(shard_full_len).enumerate().par_bridge().map(|(idx, full)| {
+            let (content, crc) = full.split_at(shard_size);
+            let mut h = Hasher::new(); h.update(content);
+            (idx, h.finalize().to_le_bytes() == crc, content)
         }).collect()
     });
+
     let mut decoder = ReedSolomonDecoder::new(DATA_SHARDS, PARITY_SHARDS, shard_size)?;
-    let mut valid_original = HashMap::new();
-    for (idx, is_ok, content) in verified {
-        if is_ok {
-            if idx < DATA_SHARDS {
-                decoder.add_original_shard(idx, content)?;
-                valid_original.insert(idx, content.to_vec());
-            } else { decoder.add_recovery_shard(idx - DATA_SHARDS, content)?; }
+    let mut shards_map = HashMap::new();
+    for (idx, ok, content) in verified {
+        if ok {
+            if idx < DATA_SHARDS { decoder.add_original_shard(idx, content)?; }
+            else { decoder.add_recovery_shard(idx - DATA_SHARDS, content)?; }
+            shards_map.insert(idx, content.to_vec());
         }
     }
+
     let result = decoder.decode()?;
     let restored: HashMap<usize, &[u8]> = result.restored_original_iter().collect();
     let mut final_data = Vec::new();
     for i in 0..DATA_SHARDS {
-        if let Some(s) = valid_original.get(&i) { final_data.extend_from_slice(s); }
+        if let Some(s) = shards_map.get(&i) { final_data.extend_from_slice(s); }
         else if let Some(s) = restored.get(&i) { final_data.extend_from_slice(s); }
-        else { return Err("RS Recovery Failed".into()); }
+        else { return Err("Recovery Failed".into()); }
     }
     final_data.truncate(actual_len);
     Ok(final_data)
@@ -242,23 +238,22 @@ pub fn locking_internal(src_path: &str, password: &str, total_size: u64, progres
     let path = Path::new(src_path);
     if !path.exists() { return Err(1); }
     
-    let mut processed_size: u64 = 0; //진행도
-    CANCEL_FLAG.store(false, Ordering::SeqCst); //작업 중단 변수 초기화
+    CANCEL_FLAG.store(false, Ordering::SeqCst);
     let mut run_result: Result<(), u8> = Ok(());
-
+    let mut processed_size: u64 = 0;
 
     let is_dir = path.is_dir();
     let file_name = path.file_name().ok_or(1u8)?.to_str().ok_or(1u8)?.as_bytes();
-
     let mut out_path = PathBuf::from(src_path);
     out_path.as_mut_os_string().push(".lock");
-    let mut writer = BufWriter::with_capacity(1024 * 1024, File::create(&out_path).map_err(|_| 5u8)?);
 
+    let mut writer = BufWriter::with_capacity(1024 * 1024, File::create(&out_path).map_err(|_| 5u8)?);
     let key_mgr = KeyManager::new();
     let encryptor = Encryptor::new(key_mgr.derive_key(password));
     let mut nonce = [0u8; NONCE_LEN];
     SystemRandom::new().fill(&mut nonce).map_err(|_| 3u8)?;
 
+    // 헤더 작성
     writer.write_all(b"LSTR").map_err(|_| 5u8)?;
     writer.write_all(&[if is_dir { 0 } else { 1 }]).map_err(|_| 5u8)?;
     writer.write_all(&(file_name.len() as u32).to_le_bytes()).map_err(|_| 5u8)?;
@@ -272,85 +267,55 @@ pub fn locking_internal(src_path: &str, password: &str, total_size: u64, progres
 
     thread::spawn(move || {
         if is_dir {
-            let mut arch = Builder::new(StreamingWriter { tx, pool_rx });
+            let mut sw = StreamingWriter { tx, pool_rx, internal_buffer: Vec::with_capacity(CHUNK_SIZE) };
+            let mut arch = Builder::new(&mut sw);
             for entry in WalkDir::new(&src_p).into_iter().filter_map(|e| e.ok()) {
-                if CANCEL_FLAG.load(Ordering::SeqCst) {
-                    return; // 스레드 즉시 종료
-                }
+                if CANCEL_FLAG.load(Ordering::SeqCst) { return; }
                 let p = entry.path();
                 let name = p.strip_prefix(Path::new(&src_p)).unwrap();
                 if p.is_file() {
                     if let Ok(f) = File::open(p) {
-                        // 1. 파일 메타데이터에서 헤더 생성
-                        if let Ok(metadata) = f.metadata() {
-                            let mut header = tar::Header::new_gnu();
-                            header.set_metadata(&metadata);
-                            
-                            // 2. BufReader를 사용하여 스트리밍 읽기
-                            let mut reader = BufReader::with_capacity(1024 * 1024, f);
-                            
-                            // 3. append_data를 통해 데이터 밀어넣기
-                            let _ = arch.append_data(&mut header, name, &mut reader);
+                        if let Ok(meta) = f.metadata() {
+                            let mut h = tar::Header::new_gnu(); h.set_metadata(&meta);
+                            let _ = arch.append_data(&mut h, name, BufReader::new(f));
                         }
                     }
                 } else if p.is_dir() && name.as_os_str() != "" { let _ = arch.append_dir(name, p); }
             }
             let _ = arch.finish();
-        } else {
-            if let Ok(f) = File::open(&src_p) {
-                let mut r = BufReader::with_capacity(1024*1024, f);
-                loop {
-                    if CANCEL_FLAG.load(Ordering::SeqCst) {
-                        return; // 스레드 즉시 종료
-                    }
-                    let mut v = pool_rx.try_recv().unwrap_or_else(|_| vec![0u8; CHUNK_SIZE]);
-                    v.resize(CHUNK_SIZE, 0);
-                    match r.read(&mut v) { Ok(0) | Err(_) => break, Ok(n) => { v.truncate(n); if tx.send(v).is_err() { break; } } }
-                }
+            drop(arch);
+            let _ = sw.flush(); // 마지막 버퍼 비우기
+        } else if let Ok(f) = File::open(&src_p) {
+            let mut r = BufReader::new(f);
+            loop {
+                if CANCEL_FLAG.load(Ordering::SeqCst) { return; }
+                let mut v = pool_rx.try_recv().unwrap_or_else(|_| vec![0u8; CHUNK_SIZE]);
+                v.resize(CHUNK_SIZE, 0);
+                match r.read(&mut v) { Ok(0) | Err(_) => break, Ok(n) => { v.truncate(n); if tx.send(v).is_err() { break; } } }
             }
         }
     });
 
-    // locking_internal 함수 내부 메인 루프
     while let Ok(chunk) = rx.recv() {
-        if CANCEL_FLAG.load(Ordering::SeqCst) {
-            run_result = Err(100);
-            break;
-        }
-
-        if chunk.is_empty() { continue; } // 빈 데이터 스킵
+        if CANCEL_FLAG.load(Ordering::SeqCst) { run_result = Err(100); break; }
+        if chunk.is_empty() { continue; }
 
         let chunk_len = chunk.len() as u64;
-        
         let enc = encryptor.encrypt(&nonce, chunk.clone()).map_err(|_| 3u8)?;
-        // RS 인코딩 호출 (여기서 4번 에러 발생 지점)
-        let payload = encode_rs_mt(enc, &pool).map_err(|e| {
-            eprintln!("RS Encoding Error: {}", e); // 구체적인 에러 메시지 출력
-            4u8
-        })?;
-    
+        let payload = encode_rs_mt(enc, &pool).map_err(|_| 4u8)?;
+
         writer.write_all(&(payload.len() as u64).to_le_bytes()).map_err(|_| 5u8)?;
         writer.write_all(&payload).map_err(|_| 5u8)?;
 
-        //진행률 계산 및 콜백 호출
         processed_size += chunk_len;
-        if total_size > 0 {
-            let progress = (processed_size as f32 / total_size as f32).min(1.0);
-            progress_callback(progress); // C#으로 현재 진행률(0.0~1.0) 전송
-        }
+        if total_size > 0 { progress_callback((processed_size as f32 / total_size as f32).min(1.0)); }
         
-        let mut old = chunk;
-        old.clear();
-        let _ = pool_tx.try_send(old);
-    }
-    writer.flush().ok();
-    drop(writer);
-
-    if let Err(e) = run_result {
-        fs::remove_file(&out_path).ok();
-        return Err(e);
+        let mut old = chunk; old.clear(); let _ = pool_tx.try_send(old);
     }
 
+    writer.flush().ok(); drop(writer);
+    if let Err(e) = run_result { fs::remove_file(&out_path).ok(); return Err(e); }
+    
     progress_callback(1.0);
     if is_dir { fs::remove_dir_all(src_path).ok(); } else { fs::remove_file(src_path).ok(); }
     Ok(())
@@ -358,33 +323,26 @@ pub fn locking_internal(src_path: &str, password: &str, total_size: u64, progres
 
 // --- [핵심 로직: Unlocking] ---
 
-pub fn unlocking_internal(lock_file_path: &str, password: &str, total_lock_size: u64,progress_callback: ProgressCallback) -> Result<(), u8> {
+pub fn unlocking_internal(lock_file_path: &str, password: &str, total_lock_size: u64, progress_callback: ProgressCallback) -> Result<(), u8> {
     let pool = rayon::ThreadPoolBuilder::new().num_threads(num_cpus::get().saturating_sub(2).max(1)).build().map_err(|_| 6u8)?;
     let lock_file = File::open(lock_file_path).map_err(|_| 2u8)?;
     
-    // 진행률 계산을 위한 전체 파일 크기 확인
-    let mut reader = BufReader::with_capacity(1024 * 1024, lock_file);
-    let mut processed_size: u64 = 0;
-
-    //작업 중단
     CANCEL_FLAG.store(false, Ordering::SeqCst);
+    let mut reader = BufReader::new(lock_file);
+    let mut processed_size: u64 = 0;
     let mut run_result: Result<(), u8> = Ok(());
 
-    // --- [헤더 읽기 로직] ---
     let mut magic = [0u8; 4]; reader.read_exact(&mut magic).map_err(|_| 2u8)?;
     if &magic != b"LSTR" { return Err(2); }
-    processed_size += 4;
 
     let mut t_buf = [0u8; 1]; reader.read_exact(&mut t_buf).map_err(|_| 2u8)?;
     let mut nl_buf = [0u8; 4]; reader.read_exact(&mut nl_buf).map_err(|_| 2u8)?;
-    let name_len = u32::from_le_bytes(nl_buf) as usize;
-    let mut name_buf = vec![0u8; name_len];
+    let mut name_buf = vec![0u8; u32::from_le_bytes(nl_buf) as usize];
     reader.read_exact(&mut name_buf).map_err(|_| 2u8)?;
     let mut salt = [0u8; 16]; reader.read_exact(&mut salt).map_err(|_| 2u8)?;
     let mut nonce = [0u8; NONCE_LEN]; reader.read_exact(&mut nonce).map_err(|_| 2u8)?;
     
-    // 헤더만큼 처리량 증가
-    processed_size += 1 + 4 + name_len as u64 + 16 + NONCE_LEN as u64;
+    processed_size += 4 + 1 + 4 + name_buf.len() as u64 + 16 + NONCE_LEN as u64;
 
     let encryptor = Encryptor::new(KeyManager::from_existing(salt).derive_key(password));
     let mut out_path = PathBuf::from(lock_file_path);
@@ -400,60 +358,47 @@ pub fn unlocking_internal(lock_file_path: &str, password: &str, total_lock_size:
         });
 
         loop {
-            if CANCEL_FLAG.load(Ordering::SeqCst) {
-                run_result = Err(100);
-                break;
-            }
+            if CANCEL_FLAG.load(Ordering::SeqCst) { run_result = Err(100); break; }
             let mut l_buf = [0u8; 8];
             if reader.read_exact(&mut l_buf).is_err() { break; }
-            let chunk_payload_len = u64::from_le_bytes(l_buf);
-            let mut b_data = vec![0u8; chunk_payload_len as usize];
-            reader.read_exact(&mut b_data).map_err(|_| 2u8)?;
+            let payload_len = u64::from_le_bytes(l_buf);
+            let mut data = vec![0u8; payload_len as usize];
+            reader.read_exact(&mut data).map_err(|_| 2u8)?;
 
-            let dec = encryptor.decrypt(&nonce, decode_rs_mt(b_data, &pool).map_err(|_| 4u8)?).map_err(|_| 3u8)?;
+            let dec = encryptor.decrypt(&nonce, decode_rs_mt(data, &pool).map_err(|_| 4u8)?).map_err(|_| 3u8)?;
             if tx.send(dec).is_err() { break; }
 
-            // 진행률 업데이트
-            processed_size += 8 + chunk_payload_len;
+            processed_size += 8 + payload_len;
             progress_callback((processed_size as f32 / total_lock_size as f32).min(1.0));
         }
-        drop(tx);
-        handle.join().ok();
-    } else { // 단일 파일 모드
-        let mut out_f = BufWriter::with_capacity(1024 * 1024, File::create(&out_path).map_err(|_| 5u8)?);
+        drop(tx); handle.join().ok();
+    } else { // 파일 모드
+        let mut out_f = BufWriter::new(File::create(&out_path).map_err(|_| 5u8)?);
         loop {
-            if CANCEL_FLAG.load(Ordering::SeqCst) {
-                run_result = Err(100);
-                break;
-            }
+            if CANCEL_FLAG.load(Ordering::SeqCst) { run_result = Err(100); break; }
             let mut l_buf = [0u8; 8];
             if reader.read_exact(&mut l_buf).is_err() { break; }
-            let chunk_payload_len = u64::from_le_bytes(l_buf);
-            let mut b_data = vec![0u8; chunk_payload_len as usize];
-            reader.read_exact(&mut b_data).map_err(|_| 2u8)?;
+            let payload_len = u64::from_le_bytes(l_buf);
+            let mut data = vec![0u8; payload_len as usize];
+            reader.read_exact(&mut data).map_err(|_| 2u8)?;
 
-            let dec = encryptor.decrypt(&nonce, decode_rs_mt(b_data, &pool).map_err(|_| 4u8)?).map_err(|_| 3u8)?;
+            let dec = encryptor.decrypt(&nonce, decode_rs_mt(data, &pool).map_err(|_| 4u8)?).map_err(|_| 3u8)?;
             out_f.write_all(&dec).map_err(|_| 5u8)?;
 
-            processed_size += 8 + chunk_payload_len;
+            processed_size += 8 + payload_len;
             progress_callback((processed_size as f32 / total_lock_size as f32).min(1.0));
         }
-        out_f.flush().ok();
-        drop(out_f);
+        out_f.flush().ok(); drop(out_f);
     }
     
     if let Err(e) = run_result {
-        // 복호화 중단 시: 풀다 만 파일이나 폴더 삭제
-        if out_path.is_dir() {
-            fs::remove_dir_all(&out_path).ok();
-        } else {
-            fs::remove_file(&out_path).ok();
-        }
+        if out_path.is_dir() { fs::remove_dir_all(&out_path).ok(); }
+        else { fs::remove_file(&out_path).ok(); }
         return Err(e);
     }
 
     progress_callback(1.0);
-    fs::remove_file(lock_file_path).ok(); // 원본 .lock 파일 삭제
+    fs::remove_file(lock_file_path).ok();
     Ok(())
 }
 
